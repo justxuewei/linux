@@ -228,19 +228,50 @@ static void __vsock_remove_connected(struct vsock_sock *vsk)
 
 static struct sock *__vsock_find_bound_socket(struct sockaddr_vm *addr)
 {
-	struct vsock_sock *vsk;
+	struct vsock_sock *vsk, *any_vsk = NULL;
 
-	list_for_each_entry(vsk, vsock_bound_sockets(addr), bound_table) {
+	rcu_read_lock();
+	list_for_each_entry (vsk, vsock_bound_sockets(addr), bound_table) {
+		/* A full match is given the highest priority. */
 		if (vsock_addr_equals_addr(addr, &vsk->local_addr))
-			return sk_vsock(vsk);
+			goto out;
 
-		if (addr->svm_port == vsk->local_addr.svm_port &&
-		    (vsk->local_addr.svm_cid == VMADDR_CID_ANY ||
-		     addr->svm_cid == VMADDR_CID_ANY))
-			return sk_vsock(vsk);
+		if (addr->svm_port == vsk->local_addr.svm_port) {
+			/* Matching the port with any CID in the local is given the
+			 * secondary priority.
+			 */
+			if (vsk->local_addr.svm_cid == VMADDR_CID_ANY)
+				goto out;
+
+			/* Matching the port with any CID in the addr is given the
+			 * lowest. A vsk whose CID of the first registered vsock device
+			 * will be selected.
+			*/
+			if (addr->svm_cid == VMADDR_CID_ANY) {
+				if (!any_vsk) {
+					any_vsk = vsk;
+					continue;
+				}
+
+				if (vsk->transport->compare_cid(
+					    any_vsk->local_addr.svm_cid,
+					    vsk->local_addr.svm_cid) < 0)
+					any_vsk = vsk;
+			}
+		}
+	}
+	rcu_read_unlock();
+
+	if (any_vsk) {
+		pr_debug("matched an any_vsk at %p\n", any_vsk);
+		return sk_vsock(any_vsk);
 	}
 
 	return NULL;
+
+out:
+	rcu_read_unlock();
+	return sk_vsock(vsk);
 }
 
 static struct sock *__vsock_find_connected_socket(struct sockaddr_vm *src,
@@ -397,7 +428,11 @@ static bool vsock_use_local_transport(unsigned int remote_cid)
 		return true;
 
 	if (transport_g2h) {
-		return remote_cid == transport_g2h->get_local_cid();
+		if (transport_g2h->get_virtio_vsock) {
+			return transport_g2h->get_virtio_vsock(remote_cid) !=
+			       NULL;
+		} else
+			return remote_cid == transport_g2h->get_local_cid();
 	} else {
 		return remote_cid == VMADDR_CID_HOST;
 	}
@@ -479,9 +514,26 @@ int vsock_assign_transport(struct vsock_sock *vsk, struct vsock_sock *psk)
 }
 EXPORT_SYMBOL_GPL(vsock_assign_transport);
 
+bool transport_g2h_verify_cid(unsigned int cid)
+{
+	/* transports that support multidev */
+	rcu_read_lock();
+	if (transport_g2h->get_virtio_vsock &&
+	    (cid == VMADDR_CID_ANY || transport_g2h->get_virtio_vsock(cid))) {
+		rcu_read_unlock();
+		return true;
+	}
+	rcu_read_unlock();
+	/* other transports */
+	if (cid == transport_g2h->get_local_cid())
+		return true;
+
+	return false;
+}
+
 bool vsock_find_cid(unsigned int cid)
 {
-	if (transport_g2h && cid == transport_g2h->get_local_cid())
+	if (transport_g2h && transport_g2h_verify_cid(cid))
 		return true;
 
 	if (transport_h2g && cid == VMADDR_CID_HOST)
@@ -660,7 +712,9 @@ static int __vsock_bind(struct sock *sk, struct sockaddr_vm *addr)
 	/* Now bind to the provided address or select appropriate values if
 	 * none are provided (VMADDR_CID_ANY and VMADDR_PORT_ANY).  Note that
 	 * like AF_INET prevents binding to a non-local IP address (in most
-	 * cases), we only allow binding to a local CID.
+	 * cases), we only allow binding to a local CID. In the cases of
+	 * multi-devices, only CIDs of vsock devices registered in the kernel
+	 * are allowed.
 	 */
 	if (addr->svm_cid != VMADDR_CID_ANY && !vsock_find_cid(addr->svm_cid))
 		return -EADDRNOTAVAIL;
@@ -1102,7 +1156,10 @@ static int vsock_dgram_sendmsg(struct socket *sock, struct msghdr *msg,
 		 */
 
 		if (remote_addr->svm_cid == VMADDR_CID_ANY)
-			remote_addr->svm_cid = transport->get_local_cid();
+			remote_addr->svm_cid =
+				transport->get_default_cid ?
+					transport->get_default_cid() :
+					transport->get_local_cid();
 
 		if (!vsock_addr_bound(remote_addr)) {
 			err = -EINVAL;
@@ -1112,7 +1169,10 @@ static int vsock_dgram_sendmsg(struct socket *sock, struct msghdr *msg,
 		remote_addr = &vsk->remote_addr;
 
 		if (remote_addr->svm_cid == VMADDR_CID_ANY)
-			remote_addr->svm_cid = transport->get_local_cid();
+			remote_addr->svm_cid =
+				transport->get_default_cid ?
+					transport->get_default_cid() :
+					transport->get_local_cid();
 
 		/* XXX Should connect() or this function ensure remote_addr is
 		 * bound?
@@ -2050,12 +2110,13 @@ static const struct net_proto_family vsock_family_ops = {
 	.owner = THIS_MODULE,
 };
 
-static long vsock_dev_do_ioctl(struct file *filp,
-			       unsigned int cmd, void __user *ptr)
+static long vsock_dev_do_ioctl(struct file *filp, unsigned int cmd,
+			       void __user *ptr)
 {
 	u32 __user *p = ptr;
 	u32 cid = VMADDR_CID_ANY;
 	int retval = 0;
+	struct vsock_local_cids local_cids;
 
 	switch (cmd) {
 	case IOCTL_VM_SOCKETS_GET_LOCAL_CID:
@@ -2069,6 +2130,21 @@ static long vsock_dev_do_ioctl(struct file *filp,
 
 		if (put_user(cid, p) != 0)
 			retval = -EFAULT;
+		break;
+
+	case IOCTL_VM_SOCKETS_GET_LOCAL_CIDS:
+		if (!transport_g2h || !transport_g2h->get_local_cids)
+			goto fault;
+
+		rcu_read_lock();
+		local_cids.nr = transport_g2h->get_local_cids(local_cids.data);
+		rcu_read_unlock();
+		if (local_cids.nr < 0 ||
+		    copy_to_user(p, &local_cids, sizeof(local_cids)))
+			goto fault;
+		break;
+	fault:
+		retval = -EFAULT;
 		break;
 
 	default:

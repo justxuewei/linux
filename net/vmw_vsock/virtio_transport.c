@@ -22,8 +22,8 @@
 #include <net/af_vsock.h>
 
 static struct workqueue_struct *virtio_vsock_workqueue;
-static struct virtio_vsock __rcu *the_virtio_vsock;
-static DEFINE_MUTEX(the_virtio_vsock_mutex); /* protects the_virtio_vsock */
+static LIST_HEAD(virtio_vsock_list); /* vsock multi-devices */
+static DEFINE_MUTEX(virtio_vsock_list_mutex); /* protects virtio_vsock_list */
 
 struct virtio_vsock {
 	struct virtio_device *vdev;
@@ -62,24 +62,61 @@ struct virtio_vsock {
 	struct virtio_vsock_event event_list[8];
 
 	u32 guest_cid;
+
+	struct list_head node;
+	struct rcu_head rcu;
 };
 
 static u32 virtio_transport_get_local_cid(void)
 {
-	struct virtio_vsock *vsock;
-	u32 ret;
+	return VMADDR_CID_ANY;
+}
 
-	rcu_read_lock();
-	vsock = rcu_dereference(the_virtio_vsock);
-	if (!vsock) {
-		ret = VMADDR_CID_ANY;
-		goto out_rcu;
+static struct virtio_vsock *virtio_transport_get_virtio_vsock(unsigned int cid)
+{
+	struct virtio_vsock *vsock;
+	list_for_each_entry (vsock, &virtio_vsock_list, node) {
+		if (vsock->guest_cid == cid)
+			return vsock;
+	}
+	return NULL;
+}
+
+static unsigned int virtio_transport_get_default_cid(void)
+{
+	struct virtio_vsock *vsock;
+	vsock = list_first_or_null_rcu(&virtio_vsock_list, struct virtio_vsock,
+				       node);
+	if (!vsock)
+		return VMADDR_CID_ANY;
+	return vsock->guest_cid;
+}
+
+static int virtio_transport_get_local_cids(u32 *cids)
+{
+	int count = 0;
+	struct virtio_vsock *vsock;
+	if (!cids)
+		return -EFAULT;
+	list_for_each_entry (vsock, &virtio_vsock_list, node) {
+		cids[count++] = vsock->guest_cid;
+	}
+	return count;
+}
+
+static int virtio_transport_compare_cid(unsigned int left, unsigned int right)
+{
+	struct virtio_vsock *vsock;
+	if (left == right)
+		return 0;
+	list_for_each_entry (vsock, &virtio_vsock_list, node) {
+		if (right == vsock->guest_cid)
+			return -1;
+		if (left == vsock->guest_cid)
+			return 1;
 	}
 
-	ret = vsock->guest_cid;
-out_rcu:
-	rcu_read_unlock();
-	return ret;
+	return 0;
 }
 
 static void
@@ -166,10 +203,14 @@ virtio_transport_send_pkt(struct virtio_vsock_pkt *pkt)
 {
 	struct virtio_vsock *vsock;
 	int len = pkt->len;
+	unsigned int src_cid = le64_to_cpu(pkt->hdr.src_cid);
 
 	rcu_read_lock();
-	vsock = rcu_dereference(the_virtio_vsock);
+	vsock = virtio_transport_get_virtio_vsock(src_cid);
 	if (!vsock) {
+		pr_debug("pkt sending was failed, as vsock "
+			 "(cid %u) not found\n",
+			 src_cid);
 		virtio_transport_free_pkt(pkt);
 		len = -ENODEV;
 		goto out_rcu;
@@ -204,19 +245,23 @@ virtio_transport_cancel_pkt(struct vsock_sock *vsk)
 	LIST_HEAD(freeme);
 
 	rcu_read_lock();
-	vsock = rcu_dereference(the_virtio_vsock);
-	if (!vsock) {
+	if (list_empty(&virtio_vsock_list)) {
 		ret = -ENODEV;
 		goto out_rcu;
 	}
 
-	spin_lock_bh(&vsock->send_pkt_list_lock);
-	list_for_each_entry_safe(pkt, n, &vsock->send_pkt_list, list) {
-		if (pkt->vsk != vsk)
-			continue;
-		list_move(&pkt->list, &freeme);
+	list_for_each_entry (vsock, &virtio_vsock_list, node) {
+		spin_lock_bh(&vsock->send_pkt_list_lock);
+		list_for_each_entry_safe (pkt, n, &vsock->send_pkt_list, list) {
+			if (pkt->vsk != vsk)
+				continue;
+			list_move(&pkt->list, &freeme);
+		}
+		spin_unlock_bh(&vsock->send_pkt_list_lock);
+		/* pkts only belong to one exact vsock */
+		if (!list_empty(&freeme))
+			break;
 	}
-	spin_unlock_bh(&vsock->send_pkt_list_lock);
 
 	list_for_each_entry_safe(pkt, n, &freeme, list) {
 		if (pkt->reply)
@@ -448,6 +493,10 @@ static struct virtio_transport virtio_transport = {
 		.module                   = THIS_MODULE,
 
 		.get_local_cid            = virtio_transport_get_local_cid,
+		.get_virtio_vsock         = virtio_transport_get_virtio_vsock,
+		.get_default_cid          = virtio_transport_get_default_cid,
+		.get_local_cids           = virtio_transport_get_local_cids,
+		.compare_cid              = virtio_transport_compare_cid,
 
 		.init                     = virtio_transport_do_socket_init,
 		.destruct                 = virtio_transport_destruct,
@@ -551,18 +600,13 @@ static int virtio_vsock_probe(struct virtio_device *vdev)
 		"event",
 	};
 	struct virtio_vsock *vsock = NULL;
-	int ret;
+	int ret, i;
+	unsigned int guest_cid;
+	struct vsock_local_cids local_cids;
 
-	ret = mutex_lock_interruptible(&the_virtio_vsock_mutex);
+	ret = mutex_lock_interruptible(&virtio_vsock_list_mutex);
 	if (ret)
 		return ret;
-
-	/* Only one virtio-vsock device per guest is supported */
-	if (rcu_dereference_protected(the_virtio_vsock,
-				lockdep_is_held(&the_virtio_vsock_mutex))) {
-		ret = -EBUSY;
-		goto out;
-	}
 
 	vsock = kzalloc(sizeof(*vsock), GFP_KERNEL);
 	if (!vsock) {
@@ -572,13 +616,30 @@ static int virtio_vsock_probe(struct virtio_device *vdev)
 
 	vsock->vdev = vdev;
 
+	virtio_vsock_update_guest_cid(vsock);
+	guest_cid = vsock->guest_cid;
+
+	if ((local_cids.nr = virtio_transport_get_local_cids(
+		     local_cids.data)) == MAX_VSOCK_NUM) {
+		pr_debug("vsock num reaches limit %d\n", MAX_VSOCK_NUM);
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	/* initialization twice is not allowed */
+	for (i = 0; i < local_cids.nr; i++) {
+		if (local_cids.data[i] == guest_cid) {
+			pr_debug("vsock (cid: %u) already exists\n", guest_cid);
+			ret = -EBUSY;
+			goto out;
+		}
+	}
+
 	ret = virtio_find_vqs(vsock->vdev, VSOCK_VQ_MAX,
 			      vsock->vqs, callbacks, names,
 			      NULL);
 	if (ret < 0)
 		goto out;
-
-	virtio_vsock_update_guest_cid(vsock);
 
 	vsock->rx_buf_nr = 0;
 	vsock->rx_buf_max_nr = 0;
@@ -609,27 +670,35 @@ static int virtio_vsock_probe(struct virtio_device *vdev)
 	mutex_unlock(&vsock->event_lock);
 
 	vdev->priv = vsock;
-	rcu_assign_pointer(the_virtio_vsock, vsock);
+	list_add_tail_rcu(&vsock->node, &virtio_vsock_list);
+	printk("virtio_vsock@%p registered (cid = %u)\n", vsock, guest_cid);
 
-	mutex_unlock(&the_virtio_vsock_mutex);
+	mutex_unlock(&virtio_vsock_list_mutex);
 	return 0;
 
 out:
 	kfree(vsock);
-	mutex_unlock(&the_virtio_vsock_mutex);
+	mutex_unlock(&virtio_vsock_list_mutex);
 	return ret;
 }
 
 static void virtio_vsock_remove(struct virtio_device *vdev)
 {
-	struct virtio_vsock *vsock = vdev->priv;
+	struct virtio_vsock *vsock, *_vsock;
 	struct virtio_vsock_pkt *pkt;
 
-	mutex_lock(&the_virtio_vsock_mutex);
+	vsock = vdev->priv;
+
+	mutex_lock(&virtio_vsock_list_mutex);
 
 	vdev->priv = NULL;
-	rcu_assign_pointer(the_virtio_vsock, NULL);
-	synchronize_rcu();
+	list_for_each_entry (_vsock, &virtio_vsock_list, node) {
+		if (vsock == _vsock) {
+			list_del_rcu(&vsock->node);
+			synchronize_rcu();
+			break;
+		}
+	}
 
 	/* Reset all connected sockets when the device disappear */
 	vsock_for_each_connected_socket(virtio_vsock_reset_sock);
@@ -684,7 +753,7 @@ static void virtio_vsock_remove(struct virtio_device *vdev)
 	flush_work(&vsock->event_work);
 	flush_work(&vsock->send_pkt_work);
 
-	mutex_unlock(&the_virtio_vsock_mutex);
+	mutex_unlock(&virtio_vsock_list_mutex);
 
 	kfree(vsock);
 }

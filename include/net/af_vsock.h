@@ -162,6 +162,19 @@ struct vsock_transport {
 
 	/* Addressing. */
 	u32 (*get_local_cid)(void);
+	/* Held rcu read lock by the caller. */
+	struct virtio_vsock *(*get_virtio_vsock)(unsigned int);
+	unsigned int (*get_default_cid)(void);
+	/* Held rcu read lock by the caller.
+	 * Get an list containing all the CIDs of registered vsock.   Return
+	 * the length of the list.
+	 */
+	int (*get_local_cids)(unsigned int *);
+	/* Held rcu read lock by the caller.
+	 * Compare priority of two devices.  Return -1 while the left takes
+	 * lower priority. Ruturn 1 otherwise.  Return 0 for unknown.
+	 */
+	int (*compare_cid)(unsigned int, unsigned int);
 };
 
 /**** CORE ****/
@@ -213,5 +226,13 @@ int vsock_init_tap(void);
 int vsock_add_tap(struct vsock_tap *vt);
 int vsock_remove_tap(struct vsock_tap *vt);
 void vsock_deliver_tap(struct sk_buff *build_skb(void *opaque), void *opaque);
+
+/**** IOCTL ****/
+
+/* Type of return value of IOCTL_VM_SOCKETS_GET_LOCAL_CIDS. */
+struct vsock_local_cids {
+	int nr;
+	unsigned int data[MAX_VSOCK_NUM];
+};
 
 #endif /* __AF_VSOCK_H__ */

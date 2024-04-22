@@ -154,6 +154,20 @@ struct sockaddr_vm {
 			       sizeof(unsigned int) - sizeof(unsigned int)];
 };
 
-#define IOCTL_VM_SOCKETS_GET_LOCAL_CID		_IO(7, 0xb9)
+/* The maximum number of vsock devices.  Each vsock device has an exclusive
+ * context id.
+*/
+
+#define MAX_VSOCK_NUM 16
+
+/* Return actual context id if the transport not support vsock
+ * multi-devices. Otherwise, return `-1U`.
+*/
+
+#define IOCTL_VM_SOCKETS_GET_LOCAL_CID _IO(7, 0xb9)
+
+/* Only available to transports with vsock multi-devices. */
+
+#define IOCTL_VM_SOCKETS_GET_LOCAL_CIDS _IOR(7, 0xba, struct vsock_local_cids)
 
 #endif /* _UAPI_VM_SOCKETS_H */
